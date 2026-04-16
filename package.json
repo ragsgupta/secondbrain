@@ -8,11 +8,17 @@
     "start": "next start",
     "lint": "eslint",
     "sync:readwise": "tsx scripts/sync-readwise.ts",
-    "sync:granola": "tsx scripts/sync-granola.ts"
+    "sync:granola": "tsx scripts/sync-granola.ts",
+    "sync:reader": "tsx scripts/sync-reader.ts",
+    "auth:google": "tsx scripts/auth-google.ts",
+    "sync:gmail": "tsx scripts/sync-gmail.ts",
+    "embed": "tsx scripts/embed-backfill.ts",
+    "chunk": "tsx scripts/chunk-embed.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.89.0",
     "@supabase/supabase-js": "^2.103.0",
+    "googleapis": "^171.4.0",
     "next": "16.2.3",
     "react": "19.2.4",
     "react-dom": "19.2.4"

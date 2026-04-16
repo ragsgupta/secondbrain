@@ -12,11 +12,19 @@ type Source = {
   people: string[];
 };
 
+type Debug = {
+  rewrites?: string[];
+  hypothetical?: string;
+  vec_hits?: number;
+  fts_hits?: number;
+};
+
 export default function Home() {
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [answer, setAnswer] = useState<string | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
+  const [debug, setDebug] = useState<Debug | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function ask(e: React.FormEvent) {
@@ -26,6 +34,7 @@ export default function Home() {
     setError(null);
     setAnswer(null);
     setSources([]);
+    setDebug(null);
     try {
       const res = await fetch("/api/ask", {
         method: "POST",
@@ -36,6 +45,7 @@ export default function Home() {
       if (!res.ok) throw new Error(data.error ?? "Unknown error");
       setAnswer(data.answer);
       setSources(data.sources ?? []);
+      setDebug(data.debug ?? null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -49,7 +59,7 @@ export default function Home() {
         <header className="mb-10">
           <h1 className="text-3xl font-semibold tracking-tight">Second Brain</h1>
           <p className="mt-2 text-sm text-zinc-500">
-            Ask questions across your Readwise highlights and Granola meetings.
+            Ask questions across your Readwise highlights, Reader articles, Granola meetings, and Gmail.
           </p>
         </header>
 
@@ -87,6 +97,30 @@ export default function Home() {
             <div className="prose prose-zinc max-w-none whitespace-pre-wrap text-[15px] leading-7 dark:prose-invert">
               {answer}
             </div>
+          </section>
+        )}
+
+        {debug && (
+          <section className="mb-6 rounded-lg border border-dashed border-zinc-300 bg-zinc-50 p-3 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900/50 dark:text-zinc-400">
+            <div className="font-mono">
+              vector hits: {debug.vec_hits ?? 0} · FTS hits: {debug.fts_hits ?? 0}
+            </div>
+            {debug.rewrites && debug.rewrites.length > 0 && (
+              <div className="mt-1 font-mono">
+                rewrites:
+                <ul className="ml-4 list-disc">
+                  {debug.rewrites.map((r, i) => (
+                    <li key={i}>{r}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {debug.hypothetical && (
+              <div className="mt-2 font-mono">
+                hypothetical:
+                <div className="ml-4 italic">&ldquo;{debug.hypothetical}&rdquo;</div>
+              </div>
+            )}
           </section>
         )}
 
