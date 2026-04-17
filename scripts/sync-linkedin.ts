@@ -94,10 +94,19 @@ function readCSV(folder: string, filename: string): Record<string, string>[] | n
     const p = path.join(folder, name);
     if (fs.existsSync(p)) {
       const raw = fs.readFileSync(p, "utf-8");
-      // Some LinkedIn exports have a "Notes:" preamble before the header row — skip those lines.
+      // LinkedIn exports often have a "Notes:" preamble before the real header row.
+      // Find the header by looking for a line that is unquoted and starts with a
+      // known column name — much more reliable than "first line with a comma".
       const lines = raw.split(/\r?\n/);
-      const headerIdx = lines.findIndex((l) => l.includes(",") && !l.startsWith("Note"));
-      const cleaned = lines.slice(headerIdx).join("\n");
+      const headerIdx = lines.findIndex(
+        (l) =>
+          !l.startsWith('"') &&
+          (l.startsWith("First Name") ||
+            l.startsWith("CONVERSATION ID") ||
+            l.startsWith("From,") ||
+            l.startsWith("Date,")),
+      );
+      const cleaned = lines.slice(headerIdx >= 0 ? headerIdx : 0).join("\n");
       return csvToObjects(parseCSV(cleaned));
     }
   }
@@ -157,11 +166,17 @@ async function syncConnections(
       };
     });
 
+    // Deduplicate within the batch — two connections can share a URL or
+    // generate the same synthetic source_id, which causes Postgres to
+    // complain about updating the same row twice in one command.
+    const uniqueDocs = Array.from(
+      new Map(docRows.map((r) => [r.source_id, r])).values(),
+    );
     const { error: docErr } = await supabase
       .from("documents")
-      .upsert(docRows, { onConflict: "source,source_id" });
+      .upsert(uniqueDocs, { onConflict: "source,source_id" });
     if (docErr) throw docErr;
-    docCount += slice.length;
+    docCount += uniqueDocs.length;
 
     // Upsert contacts for connections that have an email address
     const contactRows = slice
@@ -253,7 +268,7 @@ async function syncMessages(
     process.stdout.write(`  upserted ${Math.min(i + CHUNK, threadEntries.length)}/${threadEntries.length} threads\r`);
   }
   process.stdout.write("\n");
-  console.log(`  ${threadEntries.size} message threads synced.`);
+  console.log(`  ${threadEntries.length} message threads synced.`);
 }
 
 // ---- Main ----------------------------------------------------------
