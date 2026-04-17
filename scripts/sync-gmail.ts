@@ -1,14 +1,19 @@
 /**
- * Sync Gmail primary-category messages from the last 90 days.
+ * Sync signal-heavy Gmail messages.
  *
- * Run with:  npm run sync:gmail
+ * Run with:
+ *   npm run sync:gmail                  (defaults to last 3 years)
+ *   npx tsx scripts/sync-gmail.ts --window 3d   (for incremental/cron runs)
+ *
+ * Filter strategy: at 100k+ emails, "everything" is mostly automated noise.
+ * Instead we bias for signal by combining Gmail's own importance heuristic
+ * with explicit sender/category filters, and include sent mail so our own
+ * replies anchor relationship context.
  *
  * For each message we:
- *   - Create/update a `documents` row (title = subject, content = body snippet + text)
+ *   - Create/update a `documents` row (title = subject, content = body + snippet)
  *   - Upsert every unique email in From/To/Cc into `contacts`
  *   - Link with `interactions` rows (kind = email_from | email_to | email_cc)
- *
- * Scoped to last 90 days and primary category to keep the corpus signal-heavy.
  */
 
 import { config as loadEnv } from "dotenv";
@@ -18,11 +23,32 @@ import { google, gmail_v1 } from "googleapis";
 import { createServerClient } from "../lib/supabase";
 
 // ---- Config --------------------------------------------------------
-// Include inbox + sent + archived personal mail from the last 90 days.
-// Explicitly exclude high-noise categories and system folders so we keep
-// real conversations but drop newsletters, shopping, social, notifications.
+// CLI: --window <value>  (e.g. 3d, 7d, 90d, 3y). Default: 3y.
+function parseWindow(): string {
+  const i = process.argv.indexOf("--window");
+  if (i >= 0 && process.argv[i + 1]) return process.argv[i + 1];
+  return "3y";
+}
+const WINDOW = parseWindow();
+
+// Signal filter: keep emails that Gmail flagged as important, OR that we sent.
+// `is:important` uses Gmail's learned importance heuristic — strong signal that
+// the thread matters. `from:me`/`in:sent` captures any conversation we engaged
+// with, even if Gmail didn't flag it. Combined, this drops the 90%+ of an inbox
+// that is automated notifications and newsletters slipping past category filters.
+//
+// Noise filter: common automated-sender patterns. `from:` matches substrings
+// anywhere in the sender address, so `-from:noreply` kills noreply@*, *@noreply.*,
+// etc. Bounce/postmaster addresses rarely carry useful content.
 const QUERY = [
-  "newer_than:90d",
+  `newer_than:${WINDOW}`,
+  "(is:important OR from:me OR in:sent)",
+  "-from:noreply",
+  "-from:no-reply",
+  "-from:notifications",
+  "-from:notification",
+  "-from:mailer-daemon",
+  "-from:postmaster",
   "-in:chats",
   "-in:spam",
   "-in:trash",
@@ -32,7 +58,8 @@ const QUERY = [
   "-category:updates",
 ].join(" ");
 const MAX_BODY_CHARS = 10_000; // truncate long threads so prompts stay reasonable
-const CONCURRENCY = 8;         // Gmail allows plenty; 8 is safe and fast
+const CONCURRENCY = 5;         // Gmail per-user quota is tight; 5 + retries stays under it
+const MAX_RETRIES = 5;         // on 429/5xx, retry with exponential backoff
 // --------------------------------------------------------------------
 
 type Addr = { name?: string; email: string };
@@ -155,6 +182,32 @@ async function listMessageIds(gmail: gmail_v1.Gmail): Promise<string[]> {
   return ids;
 }
 
+/**
+ * Drop ids already in `documents` (source='gmail'). Keeps re-runs and cron
+ * runs cheap — we only fetch bodies for truly new messages.
+ *
+ * Supabase .in() caps around a few thousand values per request, so we chunk
+ * the lookup in batches of 500.
+ */
+async function filterUnsynced(
+  supabase: ReturnType<typeof createServerClient>,
+  ids: string[],
+): Promise<string[]> {
+  const have = new Set<string>();
+  const CHUNK = 500;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const { data, error } = await supabase
+      .from("documents")
+      .select("source_id")
+      .eq("source", "gmail")
+      .in("source_id", slice);
+    if (error) throw error;
+    for (const r of data ?? []) have.add(r.source_id as string);
+  }
+  return ids.filter((id) => !have.has(id));
+}
+
 type MessageDoc = {
   id: string;
   threadId: string;
@@ -168,34 +221,60 @@ type MessageDoc = {
   labelIds: string[];
 };
 
+function isRateLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // googleapis surfaces 429s as "Quota exceeded" or "Rate Limit Exceeded" strings,
+  // and 5xxs as "Backend Error"/"Internal error". All are worth retrying.
+  return (
+    /quota exceeded/i.test(msg) ||
+    /rate limit/i.test(msg) ||
+    /backend error/i.test(msg) ||
+    /internal error/i.test(msg) ||
+    / 429\b/.test(msg) ||
+    / 5\d\d\b/.test(msg)
+  );
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function fetchMessage(gmail: gmail_v1.Gmail, id: string): Promise<MessageDoc | null> {
-  try {
-    const { data } = await gmail.users.messages.get({
-      userId: "me",
-      id,
-      format: "full",
-    });
-    const headers = data.payload?.headers ?? [];
-    const subject = header(headers, "Subject") ?? "(no subject)";
-    const dateRaw = header(headers, "Date");
-    const date = dateRaw ? new Date(dateRaw).toISOString() : null;
-    const body = extractBody(data.payload).slice(0, MAX_BODY_CHARS);
-    return {
-      id: data.id!,
-      threadId: data.threadId ?? "",
-      subject,
-      date,
-      snippet: data.snippet ?? "",
-      body,
-      from: parseAddressList(header(headers, "From")),
-      to: parseAddressList(header(headers, "To")),
-      cc: parseAddressList(header(headers, "Cc")),
-      labelIds: data.labelIds ?? [],
-    };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`\n  skip ${id}: ${msg}`);
-    return null;
+  let attempt = 0;
+  while (true) {
+    try {
+      const { data } = await gmail.users.messages.get({
+        userId: "me",
+        id,
+        format: "full",
+      });
+      const headers = data.payload?.headers ?? [];
+      const subject = header(headers, "Subject") ?? "(no subject)";
+      const dateRaw = header(headers, "Date");
+      const date = dateRaw ? new Date(dateRaw).toISOString() : null;
+      const body = extractBody(data.payload).slice(0, MAX_BODY_CHARS);
+      return {
+        id: data.id!,
+        threadId: data.threadId ?? "",
+        subject,
+        date,
+        snippet: data.snippet ?? "",
+        body,
+        from: parseAddressList(header(headers, "From")),
+        to: parseAddressList(header(headers, "To")),
+        cc: parseAddressList(header(headers, "Cc")),
+        labelIds: data.labelIds ?? [],
+      };
+    } catch (err) {
+      if (isRateLimitError(err) && attempt < MAX_RETRIES) {
+        // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s (+ up to 1s jitter).
+        const delay = 1000 * Math.pow(2, attempt) + Math.random() * 1000;
+        await sleep(delay);
+        attempt++;
+        continue;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`\n  skip ${id}: ${msg}`);
+      return null;
+    }
   }
 }
 
@@ -235,13 +314,27 @@ function collectPeople(msgs: MessageDoc[]): Map<string, { email: string; name?: 
 }
 
 async function main() {
+  const countOnly = process.argv.includes("--count");
   const gmail = google.gmail({ version: "v1", auth: getOAuthClient() });
-  const supabase = createServerClient();
 
+  console.log(`Window: ${WINDOW}`);
   console.log(`Listing Gmail messages matching: "${QUERY}"…`);
-  const ids = await listMessageIds(gmail);
-  if (ids.length === 0) {
+  const allIds = await listMessageIds(gmail);
+  if (countOnly) {
+    console.log(`\nTotal matching messages: ${allIds.length}`);
+    return;
+  }
+  const supabase = createServerClient();
+  if (allIds.length === 0) {
     console.log("Nothing to sync.");
+    return;
+  }
+
+  console.log(`Filtering out already-synced messages…`);
+  const ids = await filterUnsynced(supabase, allIds);
+  console.log(`  ${ids.length} new, ${allIds.length - ids.length} already synced.`);
+  if (ids.length === 0) {
+    console.log("Nothing new to fetch.");
     return;
   }
   console.log(`Fetching bodies for ${ids.length} messages…`);

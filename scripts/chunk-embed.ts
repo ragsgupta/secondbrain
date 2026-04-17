@@ -83,40 +83,95 @@ function contextualize(chunk: string, title: string | null): string {
   return t ? `${t}\n\n${chunk}` : chunk;
 }
 
-async function loadDocsWithoutChunks(
+const PAGE = 1000; // Supabase PostgREST caps responses at 1000 rows by default.
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+type ChunkRow = {
+  document_id: number;
+  chunk_index: number;
+  content: string;
+  embedding: string;
+};
+
+/**
+ * Upsert with retry. Supabase's statement timeout (~8s default) trips when the
+ * HNSW vector index has a lot of concurrent writes. Exponential backoff gives
+ * the index a moment to catch up.
+ */
+async function upsertWithRetry(
   supabase: ReturnType<typeof createServerClient>,
+  rows: ChunkRow[],
+  maxAttempts = 5,
+): Promise<void> {
+  let attempt = 0;
+  while (true) {
+    const { error } = await supabase
+      .from("chunks")
+      .upsert(rows, { onConflict: "document_id,chunk_index" });
+    if (!error) return;
+    const details = (error as { details?: string }).details ?? "";
+    const retryable =
+      error.code === "57014" || // statement_timeout
+      error.code === "40001" || // serialization_failure
+      error.code === "40P01" || // deadlock_detected
+      /timeout/i.test(error.message ?? "") ||
+      /ETIMEDOUT|ECONNRESET|ECONNREFUSED|fetch failed/i.test(error.message ?? "") ||
+      /ETIMEDOUT|ECONNRESET/i.test(details);
+    if (!retryable || attempt >= maxAttempts) throw error;
+    const delay = 1000 * Math.pow(2, attempt) + Math.random() * 500;
+    console.warn(`\n  upsert ${error.code} — retrying in ${Math.round(delay)}ms`);
+    await sleep(delay);
+    attempt++;
+  }
+}
+
+/** Paginate every row's document_id in `chunks` to build the "already chunked" set. */
+async function loadDocIdsWithChunks(
+  supabase: ReturnType<typeof createServerClient>,
+): Promise<Set<number>> {
+  const has = new Set<number>();
+  let from = 0;
+  while (true) {
+    const { data, error } = await supabase
+      .from("chunks")
+      .select("document_id")
+      .order("id", { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    for (const r of data) has.add(r.document_id as number);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return has;
+}
+
+/** Pull the next page of documents not already in `has`. Returns empty when exhausted. */
+async function nextDocBatch(
+  supabase: ReturnType<typeof createServerClient>,
+  has: Set<number>,
+  cursor: { lastId: number },
   limit: number,
 ): Promise<Doc[]> {
-  // Pull documents with no rows in chunks. Done via a LEFT JOIN emulated with two queries
-  // because Supabase's JS client doesn't easily express "not exists".
-  const { data: existing, error: e1 } = await supabase
-    .from("chunks")
-    .select("document_id")
-    .limit(100_000);
-  if (e1) throw e1;
-  const has = new Set((existing ?? []).map((r) => r.document_id as number));
-
-  // Now pull documents in batches until we find `limit` that aren't in `has`.
   const out: Doc[] = [];
-  let page = 0;
   while (out.length < limit) {
-    const from = page * 500;
-    const to = from + 499;
     const { data, error } = await supabase
       .from("documents")
       .select("id, title, content")
+      .gt("id", cursor.lastId)
       .order("id", { ascending: true })
-      .range(from, to);
+      .limit(PAGE);
     if (error) throw error;
     if (!data || data.length === 0) break;
     for (const d of data as Doc[]) {
+      cursor.lastId = d.id;
       if (!has.has(d.id)) {
         out.push(d);
         if (out.length >= limit) break;
       }
     }
-    if (data.length < 500) break;
-    page++;
+    if (data.length < PAGE) break;
   }
   return out;
 }
@@ -132,11 +187,19 @@ async function main() {
     if (error) throw error;
   }
 
+  // Preload the "already chunked" set ONCE. We add to it as we process batches,
+  // so we never re-scan the chunks table. This also makes the first-iteration
+  // log honest about scope: N docs already chunked means N we're skipping.
+  console.log("Loading existing chunk index…");
+  const has = rebuild ? new Set<number>() : await loadDocIdsWithChunks(supabase);
+  console.log(`  ${has.size} docs already have chunks.`);
+
   let totalDocs = 0;
   let totalChunks = 0;
+  const cursor = { lastId: 0 };
 
   while (true) {
-    const docs = await loadDocsWithoutChunks(supabase, DOC_BATCH);
+    const docs = await nextDocBatch(supabase, has, cursor, DOC_BATCH);
     if (docs.length === 0) break;
 
     // 1) Chunk every doc in this batch, accumulating rows to insert.
@@ -180,20 +243,18 @@ async function main() {
     }
     process.stdout.write("\n");
 
-    // 3) Insert chunks with their embeddings.
+    // 3) Insert chunks with their embeddings. Keep batches small — Supabase's
+    //    default ~8s statement timeout bites when HNSW index updates pile up.
     const rows = pending.map((p, i) => ({
       document_id: p.document_id,
       chunk_index: p.chunk_index,
       content: p.content,
       embedding: embeddings[i] as unknown as string,
     }));
-    const INSERT_CHUNK = 200;
+    const INSERT_CHUNK = 50;
     for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
       const slice = rows.slice(i, i + INSERT_CHUNK);
-      const { error } = await supabase
-        .from("chunks")
-        .upsert(slice, { onConflict: "document_id,chunk_index" });
-      if (error) throw error;
+      await upsertWithRetry(supabase, slice);
     }
 
     totalDocs += docs.length;
