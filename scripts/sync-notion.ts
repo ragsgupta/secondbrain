@@ -57,9 +57,10 @@ async function withRetry<T>(fn: () => Promise<T>, label = ""): Promise<T> {
         status === 502 ||
         (typeof status === "number" && status >= 500) ||
         code === "rate_limited" ||
+        code === "notionhq_client_request_timeout" ||
         /UND_ERR|ETIMEDOUT|ECONNRESET|ECONNREFUSED|fetch failed/i.test(code) ||
-        /fetch failed|connect timeout/i.test(msg);
-      if (!retryable || attempt >= 6) throw err;
+        /fetch failed|connect timeout|request timeout/i.test(msg);
+      if (!retryable || attempt >= 8) throw err;
       const delay = 1000 * Math.pow(2, attempt) + Math.random() * 500;
       if (attempt === 0 && label) process.stdout.write(`\n  retrying ${label}…`);
       await sleep(delay);
@@ -68,8 +69,31 @@ async function withRetry<T>(fn: () => Promise<T>, label = ""): Promise<T> {
   }
 }
 
+// ---- Window flag ---------------------------------------------------
+function parseWindow(): string | null {
+  const i = process.argv.indexOf("--window");
+  if (i >= 0 && process.argv[i + 1]) return process.argv[i + 1];
+  return null;
+}
+
+function windowToDate(w: string): Date {
+  const now = new Date();
+  const m = w.match(/^(\d+)([dwmy])$/);
+  if (!m) throw new Error(`Invalid --window: "${w}". Expected format like 3d, 2w, 6m.`);
+  const n = parseInt(m[1], 10);
+  const unit = m[2];
+  if (unit === "d") now.setDate(now.getDate() - n);
+  else if (unit === "w") now.setDate(now.getDate() - n * 7);
+  else if (unit === "m") now.setMonth(now.getMonth() - n);
+  else if (unit === "y") now.setFullYear(now.getFullYear() - n);
+  return now;
+}
+
 // ---- Page listing --------------------------------------------------
-async function fetchAllPages(notion: Client): Promise<PageObjectResponse[]> {
+async function fetchAllPages(
+  notion: Client,
+  editedAfter: Date | null,
+): Promise<PageObjectResponse[]> {
   const pages: PageObjectResponse[] = [];
   let cursor: string | undefined;
   do {
@@ -81,7 +105,10 @@ async function fetchAllPages(notion: Client): Promise<PageObjectResponse[]> {
       }),
     );
     for (const r of res.results) {
-      if (isFullPage(r)) pages.push(r);
+      if (!isFullPage(r)) continue;
+      // When running incrementally, skip pages not edited in the window.
+      if (editedAfter && new Date(r.last_edited_time) < editedAfter) continue;
+      pages.push(r);
     }
     cursor = res.has_more && res.next_cursor ? res.next_cursor : undefined;
     process.stdout.write(`  found ${pages.length} pages…\r`);
@@ -207,13 +234,21 @@ async function main() {
   const notion = getNotion();
   const supabase = createServerClient();
 
-  console.log("Fetching all accessible Notion pages…");
-  const pages = await fetchAllPages(notion);
+  const windowArg = parseWindow();
+  const editedAfter = windowArg ? windowToDate(windowArg) : null;
+  if (editedAfter) {
+    console.log(`Incremental mode: pages edited after ${editedAfter.toISOString().slice(0, 10)}`);
+  } else {
+    console.log("Full sync mode (all pages).");
+  }
+
+  console.log("Fetching accessible Notion pages…");
+  const pages = await fetchAllPages(notion, editedAfter);
   if (pages.length === 0) {
-    console.log("No pages found. Make sure you've shared pages with the integration.");
+    console.log("No pages found (or none edited in the window).");
     return;
   }
-  console.log(`${pages.length} pages found. Fetching content…`);
+  console.log(`${pages.length} pages to sync. Fetching content…`);
 
   // Fetch full block content for every page (rate-limited).
   type PageData = { page: PageObjectResponse; title: string; content: string | null };
@@ -227,7 +262,7 @@ async function main() {
       const content = lines.join("\n").trim().slice(0, MAX_CONTENT_CHARS) || null;
       done++;
       process.stdout.write(`  fetched ${done}/${pages.length} pages\r`);
-      await sleep(350); // ~3 req/sec breathing room between pages
+      await sleep(500); // ~2 req/sec breathing room between pages
       return { page, title, content };
     },
   );
