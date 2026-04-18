@@ -6,10 +6,13 @@ on:
     - cron: '0 11 * * *'
   workflow_dispatch: # allows manual trigger from the GitHub Actions UI
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 45 # generous ceiling; incremental syncs typically finish in ~5 min
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4.2.2
@@ -22,7 +25,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Sync Notion pages
+      - name: Sync Notion pages (last 2 days)
+        timeout-minutes: 10
         run: npx tsx scripts/sync-notion.ts --window 2d
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -30,6 +34,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
       - name: Sync Readwise highlights
+        timeout-minutes: 10
         run: npm run sync:readwise
         env:
           READWISE_API_TOKEN: ${{ secrets.READWISE_API_TOKEN }}
@@ -37,6 +42,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
       - name: Sync Readwise Reader articles
+        timeout-minutes: 10
         run: npm run sync:reader
         env:
           READWISE_API_TOKEN: ${{ secrets.READWISE_API_TOKEN }}
@@ -44,6 +50,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
       - name: Sync Granola meetings
+        timeout-minutes: 10
         run: npm run sync:granola
         env:
           GRANOLA_API_KEY: ${{ secrets.GRANOLA_API_KEY }}
@@ -51,6 +58,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
       - name: Sync Google Calendar (last 3 days)
+        timeout-minutes: 10
         run: npx tsx scripts/sync-calendar.ts --window 3d
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -60,7 +68,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
       - name: Sync Gmail (last 3 days)
-        # Use tsx directly so we can pass --window 3d; npm run sync:gmail has no args.
+        timeout-minutes: 15
         run: npx tsx scripts/sync-gmail.ts --window 3d
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -70,6 +78,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
       - name: Chunk and embed new documents
+        timeout-minutes: 30
         run: npm run chunk
         env:
           VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
