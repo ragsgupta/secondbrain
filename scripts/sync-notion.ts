@@ -28,7 +28,7 @@ import { createServerClient } from "../lib/supabase";
 
 // ---- Config --------------------------------------------------------
 const MAX_CONTENT_CHARS = 20_000; // cap per page so Voyage/Claude prompts stay sane
-const BLOCK_DEPTH_LIMIT = 5;       // how deep to recurse into nested blocks
+const BLOCK_DEPTH_LIMIT = 3;       // how deep to recurse into nested blocks
 const CONCURRENCY = 1;             // sequential — recursive block fetches burst hard at 2+
 // --------------------------------------------------------------------
 
@@ -248,25 +248,59 @@ async function main() {
     console.log("No pages found (or none edited in the window).");
     return;
   }
-  console.log(`${pages.length} pages to sync. Fetching content…`);
+  console.log(`${pages.length} pages in window. Checking which need content refresh…`);
 
-  // Fetch full block content for every page (rate-limited).
+  // Load already-synced last_edited_time values so we can skip pages that
+  // haven't changed since our last sync (avoids redundant block-content fetches).
+  const alreadySynced = new Map<string, string>(); // page_id → last_edited_time
+  {
+    const PAGE = 1000;
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase
+        .from("documents")
+        .select("source_id, metadata")
+        .eq("source", "notion")
+        .range(from, from + PAGE - 1);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      for (const r of data) {
+        const meta = r.metadata as Record<string, string> | null;
+        if (meta?.last_edited_time) alreadySynced.set(r.source_id as string, meta.last_edited_time);
+      }
+      if (data.length < PAGE) break;
+      from += PAGE;
+    }
+  }
+  console.log(`  ${alreadySynced.size} pages already in DB.`);
+
+  const toFetch = pages.filter(
+    (p) => alreadySynced.get(p.id) !== p.last_edited_time,
+  );
+  const unchanged = pages.length - toFetch.length;
+  console.log(`  ${toFetch.length} changed, ${unchanged} unchanged (skipping content fetch).`);
+
+  // Fetch full block content only for pages that actually changed.
   type PageData = { page: PageObjectResponse; title: string; content: string | null };
   let done = 0;
   const pageData = await mapLimit<PageObjectResponse, PageData>(
-    pages,
+    toFetch,
     CONCURRENCY,
     async (page) => {
       const title = getTitle(page);
       const lines = await fetchPageContent(notion, page.id);
       const content = lines.join("\n").trim().slice(0, MAX_CONTENT_CHARS) || null;
       done++;
-      process.stdout.write(`  fetched ${done}/${pages.length} pages\r`);
+      process.stdout.write(`  fetched ${done}/${toFetch.length} pages\r`);
       await sleep(500); // ~2 req/sec breathing room between pages
       return { page, title, content };
     },
   );
   process.stdout.write("\n");
+  if (pageData.length === 0) {
+    console.log("All pages up to date — nothing to upsert.");
+    return;
+  }
 
   // Upsert documents
   console.log("Upserting documents…");
