@@ -6,6 +6,7 @@ import { config as loadEnv } from "dotenv";
 loadEnv({ path: ".env.local" });
 
 import { createServerClient } from "../lib/supabase";
+import { embed } from "../lib/voyage";
 
 async function main() {
   const supabase = createServerClient();
@@ -50,14 +51,44 @@ async function main() {
     .limit(5);
   console.log(`Recent chunks point to doc_ids:`, sample?.map((r) => r.document_id));
 
-  // Break down docs by source
-  const { data: bySource } = await supabase
-    .from("documents")
-    .select("source")
-    .order("id", { ascending: true });
-  const counts: Record<string, number> = {};
-  for (const r of bySource ?? []) counts[r.source as string] = (counts[r.source as string] ?? 0) + 1;
-  console.log(`Documents by source:`, counts);
+  // Fix bySource: paginate to avoid 1000-row PostgREST default limit
+  const sourceCounts: Record<string, number> = {};
+  let srcFrom = 0;
+  while (true) {
+    const { data, error } = await supabase
+      .from("documents")
+      .select("source")
+      .order("id", { ascending: true })
+      .range(srcFrom, srcFrom + PAGE - 1);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    for (const r of data) sourceCounts[r.source as string] = (sourceCounts[r.source as string] ?? 0) + 1;
+    if (data.length < PAGE) break;
+    srcFrom += PAGE;
+  }
+  console.log(`Documents by source:`, sourceCounts);
+
+  // Test match_chunks directly with a real embedding
+  console.log(`\nTesting match_chunks RPC…`);
+  try {
+    const [vec] = await embed(["security operations physical infrastructure"], "query");
+    console.log(`  Embedding OK — dim=${vec.length}, first3=[${vec.slice(0, 3).map(v => v.toFixed(4)).join(", ")}]`);
+
+    const { data: rpcData, error: rpcErr } = await supabase.rpc("match_chunks", {
+      query_embedding: vec as unknown as string,
+      match_limit: 5,
+    });
+    if (rpcErr) {
+      console.error(`  match_chunks ERROR:`, rpcErr);
+    } else {
+      console.log(`  match_chunks returned ${(rpcData as unknown[])?.length ?? 0} rows`);
+      if (rpcData && (rpcData as unknown[]).length > 0) {
+        console.log(`  Top hit:`, (rpcData as Record<string, unknown>[])[0]);
+      }
+    }
+  } catch (e) {
+    console.error(`  Embed or RPC threw:`, e);
+  }
 }
 
 main().catch((err) => {
