@@ -3,7 +3,8 @@ import { createServerClient } from "@/lib/supabase";
 import { getAnthropic, DEFAULT_MODEL } from "@/lib/anthropic";
 import { embed } from "@/lib/voyage";
 
-const MAX_DOCS = 60;
+const MAX_DOCS = 70;
+const LINKEDIN_RESERVED = 20; // guaranteed slots for LinkedIn connections when persona terms exist
 const FTS_PER_QUERY = 12;
 const VECTOR_LIMIT = 60;
 const MAX_CHARS_PER_DOC = 2000;
@@ -204,20 +205,41 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Merge: vector hits first (semantic), then LinkedIn-specific persona matches,
-    // then general FTS-only hits. LinkedIn connections get their own lane because
-    // sparse profile content can't compete against rich docs in vector search.
+    // Merge with guaranteed LinkedIn slots. When persona terms were generated,
+    // reserve LINKEDIN_RESERVED slots for LinkedIn connections — otherwise the 60
+    // vector hits fill the context window with internal Asylon docs the user
+    // already knows, leaving no room for new network contacts.
     const merged: number[] = [];
     const seen = new Set<number>();
-    for (const id of idsFromVec) {
-      if (!seen.has(id)) { seen.add(id); merged.push(id); }
-    }
+
+    const linkedinSlots = linkedinTerms.length > 0 ? LINKEDIN_RESERVED : 0;
+    const otherSlots = MAX_DOCS - linkedinSlots;
+
+    // Fill the LinkedIn-reserved pool first (up to linkedinSlots).
+    const linkedinPicked: number[] = [];
     for (const id of idsFromLinkedin) {
-      if (!seen.has(id)) { seen.add(id); merged.push(id); }
+      if (!seen.has(id) && linkedinPicked.length < linkedinSlots) {
+        seen.add(id); linkedinPicked.push(id);
+      }
     }
-    for (const id of idsFromFts) {
-      if (!seen.has(id)) { seen.add(id); merged.push(id); }
+
+    // Fill the remaining pool from vector then FTS.
+    const otherPicked: number[] = [];
+    for (const id of [...idsFromVec, ...idsFromFts]) {
+      if (!seen.has(id) && otherPicked.length < otherSlots) {
+        seen.add(id); otherPicked.push(id);
+      }
     }
+
+    // Interleave: lead with other (context-rich) docs, intersperse LinkedIn.
+    // Ratio ~2:1 so the model sees enough context before each contact batch.
+    let li = 0; let ot = 0;
+    while (li < linkedinPicked.length || ot < otherPicked.length) {
+      if (ot < otherPicked.length) merged.push(otherPicked[ot++]);
+      if (ot < otherPicked.length) merged.push(otherPicked[ot++]);
+      if (li < linkedinPicked.length) merged.push(linkedinPicked[li++]);
+    }
+
     const docIds = merged.slice(0, MAX_DOCS);
 
     if (docIds.length === 0) {
@@ -313,6 +335,7 @@ ${formattedDocs}`;
         vec_hits: idsFromVec.length,
         fts_hits: idsFromFts.size,
         linkedin_hits: idsFromLinkedin.size,
+        linkedin_in_context: linkedinPicked.length,
         ...(vecError ? { vec_error: vecError } : {}),
       },
     });
