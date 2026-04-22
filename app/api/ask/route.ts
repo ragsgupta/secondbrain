@@ -15,7 +15,6 @@ type DocRow = {
   content: string | null;
   url: string | null;
   occurred_at: string | null;
-  metadata: Record<string, unknown> | null;
 };
 
 type ContactRow = {
@@ -54,23 +53,25 @@ function formatDocForPrompt(doc: DocRow, idx: number, people: string[]): string 
  */
 async function expandQuery(
   question: string,
-): Promise<{ keywords: string[]; hypothetical: string }> {
+): Promise<{ keywords: string[]; hypothetical: string; linkedinTerms: string[] }> {
   const anthropic = getAnthropic();
   const res = await anthropic.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 500,
-    system: `You expand a user's question into retrieval helpers for a personal knowledge base (emails, notes, meeting transcripts, article summaries).
+    max_tokens: 700,
+    system: `You expand a user's question into retrieval helpers for a personal knowledge base (emails, notes, meeting transcripts, article summaries, and LinkedIn connections).
 
 Output EXACTLY this JSON and nothing else — no preamble, no code fences:
 {
   "keywords": ["3-5 short search queries with synonyms and common phrasings real documents would use"],
-  "hypothetical": "2-4 sentences written in the voice of someone writing a RELEVANT DOCUMENT (e.g., an email TO the user, or a meeting transcript). Not the question's words — the kind of phrasing an actual matching doc would contain. This string will be embedded for semantic search."
+  "hypothetical": "2-4 sentences written in the voice of someone writing a RELEVANT DOCUMENT (e.g., an email TO the user, or a meeting transcript). Not the question's words — the kind of phrasing an actual matching doc would contain. This string will be embedded for semantic search.",
+  "linkedin_terms": ["5-10 role titles, job functions, or industry sectors that a RELEVANT BUYER/CONTACT would have in their LinkedIn profile — think about who would purchase or care about this, not the product domain itself. Use short fragments that would appear verbatim in a job title or company name."]
 }
 
-Example for "who has reached out to me for advice?":
+Example for "who should I reach out to about a drone-based warehouse security product?":
 {
-  "keywords": ["seeking advice guidance", "wanted your perspective", "catch up career help", "asking for intros", "pick your brain"],
-  "hypothetical": "Hey, I wanted to put something on your radar. I'm thinking about my next move and would really value your perspective. Would love to catch up soon — even a quick call works. Your thoughts have always helped me frame my thinking."
+  "keywords": ["warehouse security automation", "drone surveillance operations", "physical security enterprise"],
+  "hypothetical": "Hey Rags, we've been evaluating new security approaches for our distribution network and the autonomous surveillance angle is really interesting. Would love to see a demo. Our team handles about 40 facilities across the midwest.",
+  "linkedin_terms": ["VP Operations", "Head of Security", "Director Facilities", "Chief Security Officer", "VP Supply Chain", "Director Loss Prevention", "Head of Logistics", "VP Real Estate", "SVP Operations", "warehousing", "distribution"]
 }`,
     messages: [{ role: "user", content: question }],
   });
@@ -84,6 +85,7 @@ Example for "who has reached out to me for advice?":
     const parsed = JSON.parse(cleaned) as {
       keywords?: unknown;
       hypothetical?: unknown;
+      linkedin_terms?: unknown;
     };
     const keywords = Array.isArray(parsed.keywords)
       ? (parsed.keywords as unknown[])
@@ -91,9 +93,14 @@ Example for "who has reached out to me for advice?":
           .slice(0, 5)
       : [];
     const hypothetical = typeof parsed.hypothetical === "string" ? parsed.hypothetical : "";
-    return { keywords, hypothetical };
+    const linkedinTerms = Array.isArray(parsed.linkedin_terms)
+      ? (parsed.linkedin_terms as unknown[])
+          .filter((k): k is string => typeof k === "string" && k.trim().length > 2)
+          .slice(0, 10)
+      : [];
+    return { keywords, hypothetical, linkedinTerms };
   } catch {
-    return { keywords: [], hypothetical: "" };
+    return { keywords: [], hypothetical: "", linkedinTerms: [] };
   }
 }
 
@@ -110,8 +117,9 @@ export async function POST(req: NextRequest) {
     const expansion = await expandQuery(question).catch(() => ({
       keywords: [] as string[],
       hypothetical: "",
+      linkedinTerms: [] as string[],
     }));
-    const { keywords: rewrites, hypothetical } = expansion;
+    const { keywords: rewrites, hypothetical, linkedinTerms } = expansion;
 
     // Embed both the raw question (as query) AND the hypothetical doc (as document).
     // Searching with the document-type embedding of a fake matching doc lands us
@@ -134,8 +142,14 @@ export async function POST(req: NextRequest) {
     // FTS across question + keyword rewrites
     const searchQueries = [question, ...rewrites];
     const idsFromFts = new Set<number>();
-    await Promise.all(
-      searchQueries.map(async (q) => {
+    // LinkedIn-specific FTS: search connection docs by buyer-persona role/industry terms.
+    // Runs in parallel with the main FTS — sparse connection docs compete poorly in
+    // general semantic search, so they get their own dedicated pass here.
+    const idsFromLinkedin = new Set<number>();
+    const LINKEDIN_PER_TERM = 20;
+
+    await Promise.all([
+      ...searchQueries.map(async (q) => {
         const { data, error } = await supabase
           .from("documents")
           .select("id")
@@ -143,23 +157,37 @@ export async function POST(req: NextRequest) {
           .limit(FTS_PER_QUERY);
         if (!error && data) for (const r of data) idsFromFts.add(r.id as number);
       }),
-    );
+      ...linkedinTerms.map(async (term) => {
+        const { data, error } = await supabase
+          .from("documents")
+          .select("id")
+          .eq("source", "linkedin_connection")
+          .textSearch("fts", term, { type: "websearch", config: "english" })
+          .limit(LINKEDIN_PER_TERM);
+        if (!error && data) for (const r of data) idsFromLinkedin.add(r.id as number);
+      }),
+    ]);
 
     // Vector search from both the query vector and the HyDE vector, in parallel.
     // match_chunks returns document_ids ranked by their BEST chunk's similarity —
     // so a doc with one strongly-matching paragraph beats a doc that's mildly
     // on-topic throughout. Fixes the dilution problem.
+    let vecError: string | null = null;
     const runMatch = async (vec: number[]): Promise<number[]> => {
       const { data, error } = await supabase.rpc("match_chunks", {
         query_embedding: vec as unknown as string,
         match_limit: VECTOR_LIMIT,
       });
-      if (error || !data) return [];
+      if (error) {
+        vecError = error.message ?? String(error);
+        return [];
+      }
+      if (!data) return [];
       return (data as { document_id: number }[]).map((r) => r.document_id);
     };
     const [vecFromQuery, vecFromHyde] = await Promise.all([
-      runMatch(queryVec).catch(() => [] as number[]),
-      hypoVec ? runMatch(hypoVec).catch(() => [] as number[]) : Promise.resolve([]),
+      runMatch(queryVec).catch((e: unknown) => { vecError = e instanceof Error ? e.message : String(e); return [] as number[]; }),
+      hypoVec ? runMatch(hypoVec).catch((e: unknown) => { vecError = e instanceof Error ? e.message : String(e); return [] as number[]; }) : Promise.resolve([]),
     ]);
 
     // Interleave vector results so top-rank hits from both sources land early.
@@ -176,20 +204,19 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Merge: prefer vector hits first (more semantic), then FTS-only.
+    // Merge: vector hits first (semantic), then LinkedIn-specific persona matches,
+    // then general FTS-only hits. LinkedIn connections get their own lane because
+    // sparse profile content can't compete against rich docs in vector search.
     const merged: number[] = [];
     const seen = new Set<number>();
     for (const id of idsFromVec) {
-      if (!seen.has(id)) {
-        seen.add(id);
-        merged.push(id);
-      }
+      if (!seen.has(id)) { seen.add(id); merged.push(id); }
+    }
+    for (const id of idsFromLinkedin) {
+      if (!seen.has(id)) { seen.add(id); merged.push(id); }
     }
     for (const id of idsFromFts) {
-      if (!seen.has(id)) {
-        seen.add(id);
-        merged.push(id);
-      }
+      if (!seen.has(id)) { seen.add(id); merged.push(id); }
     }
     const docIds = merged.slice(0, MAX_DOCS);
 
@@ -203,7 +230,7 @@ export async function POST(req: NextRequest) {
 
     const { data: docsRaw, error: docErr } = await supabase
       .from("documents")
-      .select("id, source, title, content, url, occurred_at, metadata")
+      .select("id, source, title, content, url, occurred_at")
       .in("id", docIds);
     if (docErr) throw docErr;
 
@@ -233,13 +260,15 @@ export async function POST(req: NextRequest) {
       .map((d, i) => formatDocForPrompt(d, i, peopleByDoc.get(d.id) ?? []))
       .join("\n\n---\n\n");
 
-    const system = `You are Rags's personal "second brain". You answer questions using ONLY the context provided below, which is drawn from Rags's Readwise highlights, Readwise Reader articles, Granola meeting notes, and Gmail.
+    const system = `You are Rags's personal "second brain". You answer questions using ONLY the context provided below, which is drawn from Rags's Readwise highlights, Readwise Reader articles, Granola meeting notes, Gmail, and LinkedIn connections/messages.
 
 Rules:
 - Ground every claim in the provided context. Cite sources inline as [#N] matching the document number.
 - If the context is insufficient, say so plainly — do not speculate or use general knowledge.
 - Be concise. Prefer bullet points for lists of people or items.
-- When the question is about people ("who should I reach out to", "who has reached out to me"), surface names with emails where available, and explain why each person is relevant based on the text.
+- When the question is about people ("who should I reach out to", "who has reached out to me"), surface names with roles and companies where available, and explain why each person is relevant based on the text.
+- Documents with source=linkedin_connection represent people in Rags's LinkedIn network. Their title shows "Name — Role at Company". When surfacing contacts, include their role and company so Rags knows why they're relevant.
+- Documents with source=linkedin_message are LinkedIn conversation threads — use these to add relationship history context.
 - When a document's tone, request, or context implies the answer even without using the literal words of the question, say so — e.g., someone asking to "catch up and share their thinking" is implicitly seeking advice.
 - Use Rags's own voice/words from highlights where illustrative.`;
 
@@ -280,8 +309,11 @@ ${formattedDocs}`;
       debug: {
         rewrites,
         hypothetical,
+        linkedin_terms: linkedinTerms,
         vec_hits: idsFromVec.length,
         fts_hits: idsFromFts.size,
+        linkedin_hits: idsFromLinkedin.size,
+        ...(vecError ? { vec_error: vecError } : {}),
       },
     });
   } catch (err) {

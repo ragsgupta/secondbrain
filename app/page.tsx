@@ -15,8 +15,11 @@ type Source = {
 type Debug = {
   rewrites?: string[];
   hypothetical?: string;
+  linkedin_terms?: string[];
   vec_hits?: number;
   fts_hits?: number;
+  linkedin_hits?: number;
+  vec_error?: string;
 };
 
 export default function Home() {
@@ -59,7 +62,7 @@ export default function Home() {
         <header className="mb-10">
           <h1 className="text-3xl font-semibold tracking-tight">Second Brain</h1>
           <p className="mt-2 text-sm text-zinc-500">
-            Ask questions across your Readwise highlights, Reader articles, Granola meetings, and Gmail.
+            Ask questions across your Readwise highlights, Reader articles, Granola meetings, Gmail, and LinkedIn connections.
           </p>
         </header>
 
@@ -103,14 +106,27 @@ export default function Home() {
         {debug && (
           <section className="mb-6 rounded-lg border border-dashed border-zinc-300 bg-zinc-50 p-3 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900/50 dark:text-zinc-400">
             <div className="font-mono">
-              vector hits: {debug.vec_hits ?? 0} · FTS hits: {debug.fts_hits ?? 0}
+              vector hits: {debug.vec_hits ?? 0} · FTS hits: {debug.fts_hits ?? 0} · LinkedIn hits: {debug.linkedin_hits ?? 0}
             </div>
+            {debug.vec_error && (
+              <div className="mt-1 font-mono text-red-500">vec error: {debug.vec_error}</div>
+            )}
             {debug.rewrites && debug.rewrites.length > 0 && (
               <div className="mt-1 font-mono">
                 rewrites:
                 <ul className="ml-4 list-disc">
                   {debug.rewrites.map((r, i) => (
                     <li key={i}>{r}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {debug.linkedin_terms && debug.linkedin_terms.length > 0 && (
+              <div className="mt-1 font-mono">
+                linkedin terms:
+                <ul className="ml-4 list-disc">
+                  {debug.linkedin_terms.map((t, i) => (
+                    <li key={i}>{t}</li>
                   ))}
                 </ul>
               </div>
