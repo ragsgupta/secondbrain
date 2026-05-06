@@ -102,7 +102,7 @@ type ChunkRow = {
 async function upsertWithRetry(
   supabase: ReturnType<typeof createServerClient>,
   rows: ChunkRow[],
-  maxAttempts = 5,
+  maxAttempts = 8,
 ): Promise<void> {
   let attempt = 0;
   while (true) {
@@ -251,10 +251,11 @@ async function main() {
       content: p.content,
       embedding: embeddings[i] as unknown as string,
     }));
-    const INSERT_CHUNK = 50;
+    const INSERT_CHUNK = 10;
     for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
       const slice = rows.slice(i, i + INSERT_CHUNK);
       await upsertWithRetry(supabase, slice);
+      await sleep(150); // let Postgres process HNSW index updates before next batch
     }
 
     totalDocs += docs.length;
